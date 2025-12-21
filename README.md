@@ -592,7 +592,7 @@ We welcome community members to help maintain and extend TurboDiffusion. Welcome
 ```
 @article{zhang2025turbodiffusion,
   title={TurboDiffusion: Accelerating Video Diffusion Models by 100-200 Times},
-  author={Zhang, Jintao and Zheng, Kaiwen and Jiang, Kai and Wang, Haoxu and Stoica, Ion and Gonzalez, Joseph E. and Chen, Jianfei and Zhu, Jun},
+  author={Zhang, Jintao and Zheng, Kaiwen and Jiang, Kai and Wang, Haoxu and Stoica, Ion and Gonzalez, Joseph E and Chen, Jianfei and Zhu, Jun},
   journal={arXiv preprint arXiv:2512.16093},
   year={2025}
 }
