@@ -1,28 +1,41 @@
 """
 TurboDiffusion TUI Server Mode
 
-A persistent GPU server that loads models once and provides an interactive
-text-based interface for video generation.
-
+A fancy, user-friendly text-based interface for video generation.
 Supports both T2V (text-to-video) and I2V (image-to-video) modes.
-
-Usage:
-    # T2V mode
-    PYTHONPATH=turbodiffusion python -m serve --mode t2v --dit_path checkpoints/model.pth
-
-    # I2V mode
-    PYTHONPATH=turbodiffusion python -m serve --mode i2v \
-        --high_noise_model_path checkpoints/high.pth \
-        --low_noise_model_path checkpoints/low.pth
 """
 
 import argparse
 import os
 
-from imaginaire.utils import log
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from .utils import RUNTIME_PARAMS, validate_args, format_config, set_runtime_param
 from .pipeline import load_models, generate_t2v, generate_i2v
+
+console = Console()
+
+# Slash commands
+COMMANDS = {
+    "/help": "Show available commands",
+    "/show": "Show current configuration",
+    "/set": "Set a runtime parameter: /set <param> <value>",
+    "/reset": "Reset runtime parameters to defaults",
+    "/quit": "Exit the server",
+}
+
+# Style for prompt_toolkit
+PROMPT_STYLE = Style.from_dict({
+    "prompt": "#00aa00 bold",
+    "command": "#ffaa00",
+})
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -92,43 +105,87 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_multiline_prompt() -> str:
-    """Read multi-line prompt from user. Empty line finishes input."""
-    lines = []
-    while True:
-        try:
-            line = input("> " if lines else "")
-            if line == "":
-                break
-            lines.append(line)
-        except EOFError:
-            if not lines:
-                return None
-            break
-    return "\n".join(lines)
+def print_header(args: argparse.Namespace):
+    """Print fancy server header."""
+    from rcm.datasets.utils import VIDEO_RES_SIZE_INFO
+    w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
+    mode_str = "[cyan]T2V[/cyan] (text-to-video)" if args.mode == "t2v" else "[magenta]I2V[/magenta] (image-to-video)"
+
+    header = Text()
+    header.append("TurboDiffusion TUI Server\n", style="bold blue")
+    header.append(f"Mode: {mode_str}\n")
+    header.append(f"Model: [green]{args.model}[/green] | ")
+    header.append(f"Resolution: [yellow]{args.resolution}[/yellow] ({w}x{h}) | ")
+    header.append(f"Steps: [yellow]{args.num_steps}[/yellow]")
+
+    console.print(Panel(header, border_style="blue"))
+    console.print("[dim]Type [bold]/help[/bold] for commands. Use [bold]\\\\[/bold] for newline in prompts.[/dim]\n")
 
 
 def print_help():
     """Print help for slash commands."""
-    print("""
-Commands:
-  /help              Show this help message
-  /show              Show current configuration
-  /set <param> <val> Set a runtime parameter
-  /reset             Reset runtime parameters to defaults
-  /quit              Exit the server
+    table = Table(title="Commands", show_header=True, header_style="bold cyan")
+    table.add_column("Command", style="yellow")
+    table.add_column("Description")
 
-Runtime parameters (adjustable with /set):
-  num_steps   Number of inference steps (1-4)
-  num_samples Number of samples per generation
-  num_frames  Number of video frames
-  sigma_max   Initial sigma for rCM
-""")
+    for cmd, desc in COMMANDS.items():
+        table.add_row(cmd, desc)
+
+    console.print(table)
+
+    # Runtime params
+    console.print("\n[bold cyan]Runtime Parameters[/bold cyan] (adjustable with /set):")
+    for param, spec in RUNTIME_PARAMS.items():
+        if "choices" in spec:
+            console.print(f"  [yellow]{param}[/yellow]: {spec['choices']}")
+        else:
+            console.print(f"  [yellow]{param}[/yellow]: {spec['type'].__name__} (min: {spec.get('min', 'none')})")
 
 
 def print_config(args: argparse.Namespace, defaults: dict):
     """Print current configuration."""
-    print(format_config(args, defaults))
+    console.print(format_config(args, defaults), markup=True)
+
+
+def get_prompt_input(history: InMemoryHistory) -> str:
+    """Get prompt from user with slash command completion."""
+    completer = WordCompleter(list(COMMANDS.keys()), ignore_case=True)
+
+    try:
+        text = prompt(
+            [("class:prompt", "prompt> ")],
+            style=PROMPT_STYLE,
+            completer=completer,
+            history=history,
+            multiline=False,
+        )
+        # Handle backslash for multiline: replace \\ with actual newline
+        text = text.replace("\\\\", "\n")
+        return text.strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def get_path_input(prompt_text: str, default: str = None, must_exist: bool = False) -> str:
+    """Get file path from user."""
+    default_hint = f" [{default}]" if default else ""
+    try:
+        text = prompt(
+            [("class:prompt", f"{prompt_text}{default_hint}: ")],
+            style=PROMPT_STYLE,
+        )
+        text = text.strip()
+
+        if not text and default:
+            return default
+
+        if must_exist and text and not os.path.isfile(text):
+            console.print(f"[red]Error: File not found: {text}[/red]")
+            return None
+
+        return text if text else None
+    except (EOFError, KeyboardInterrupt):
+        return None
 
 
 def handle_command(cmd: str, args: argparse.Namespace, defaults: dict) -> bool:
@@ -144,33 +201,22 @@ def handle_command(cmd: str, args: argparse.Namespace, defaults: dict) -> bool:
         print_config(args, defaults)
     elif command == "/set":
         if len(parts) != 3:
-            print("Usage: /set <param> <value>")
+            console.print("[red]Usage: /set <param> <value>[/red]")
         else:
             success, msg = set_runtime_param(args, parts[1], parts[2])
-            print(msg if success else f"Error: {msg}")
+            if success:
+                console.print(f"[green]{msg}[/green]")
+            else:
+                console.print(f"[red]Error: {msg}[/red]")
     elif command == "/reset":
         for param, default in defaults.items():
             setattr(args, param, default)
-        print("Runtime parameters reset to defaults.")
+        console.print("[green]Runtime parameters reset to defaults.[/green]")
     else:
-        print(f"Unknown command: {command}")
-        print("Type /help for available commands.")
+        console.print(f"[red]Unknown command: {command}[/red]")
+        console.print("[dim]Type /help for available commands.[/dim]")
 
     return True
-
-
-def print_header(args: argparse.Namespace):
-    """Print server header with current config."""
-    from rcm.datasets.utils import VIDEO_RES_SIZE_INFO
-    w, h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
-    mode_str = "T2V (text-to-video)" if args.mode == "t2v" else "I2V (image-to-video)"
-    print(f"""
-TurboDiffusion TUI Server
-=========================
-Mode: {mode_str} | Model: {args.model}
-Resolution: {args.resolution} ({w}x{h}) | Steps: {args.num_steps}
-Type /help for commands, or enter a prompt to generate.
-""")
 
 
 def run_tui(models: dict, args: argparse.Namespace):
@@ -179,77 +225,65 @@ def run_tui(models: dict, args: argparse.Namespace):
     last_output_path = "output/generated_video.mp4"
     last_image_path = None
 
+    prompt_history = InMemoryHistory()
+
     print_header(args)
 
     while True:
-        print("Prompt (empty line to generate):")
-        prompt = get_multiline_prompt()
+        # Get prompt
+        user_input = get_prompt_input(prompt_history)
 
-        if prompt is None:
-            print("\nGoodbye!")
+        if user_input is None:
+            console.print("\n[dim]Goodbye![/dim]")
             break
 
-        prompt = prompt.strip()
-
-        if not prompt:
+        if not user_input:
             continue
 
-        if prompt.startswith("/"):
-            if not handle_command(prompt, args, defaults):
-                print("Goodbye!")
+        # Handle slash commands
+        if user_input.startswith("/"):
+            if not handle_command(user_input, args, defaults):
+                console.print("[dim]Goodbye![/dim]")
                 break
             continue
+
+        prompt_text = user_input
 
         # For I2V mode, get image path
         image_path = None
         if args.mode == "i2v":
-            try:
-                default_hint = f" [{last_image_path}]" if last_image_path else ""
-                user_image = input(f"Image path{default_hint}: ").strip()
-                if not user_image and last_image_path:
-                    image_path = last_image_path
-                elif user_image:
-                    image_path = user_image
-                else:
-                    print("Error: Image path is required for I2V mode.")
-                    continue
-
-                if not os.path.isfile(image_path):
-                    print(f"Error: Image file not found: {image_path}")
-                    continue
-
-                last_image_path = image_path
-            except EOFError:
-                print("\nGoodbye!")
-                break
+            image_path = get_path_input("image", last_image_path, must_exist=True)
+            if image_path is None:
+                console.print("[yellow]Cancelled.[/yellow]")
+                continue
+            last_image_path = image_path
 
         # Get output path
-        try:
-            user_path = input(f"Output path [{last_output_path}]: ").strip()
-        except EOFError:
-            print("\nGoodbye!")
-            break
-
-        output_path = user_path if user_path else last_output_path
+        output_path = get_path_input("output", last_output_path)
+        if output_path is None:
+            console.print("[yellow]Cancelled.[/yellow]")
+            continue
 
         if not output_path.endswith(".mp4"):
             output_path += ".mp4"
 
         # Generate
+        console.print()
         try:
-            if args.mode == "t2v":
-                result_path = generate_t2v(models, args, prompt, output_path)
-            else:
-                result_path = generate_i2v(models, args, prompt, image_path, output_path)
+            with console.status("[bold green]Generating video...", spinner="dots"):
+                if args.mode == "t2v":
+                    result_path = generate_t2v(models, args, prompt_text, output_path)
+                else:
+                    result_path = generate_i2v(models, args, prompt_text, image_path, output_path)
 
-            log.success(f"Generated: {result_path}")
+            console.print(f"[bold green]Done:[/bold green] {result_path}")
             last_output_path = result_path
         except Exception as e:
-            log.error(f"Generation failed: {e}")
+            console.print(f"[bold red]Error:[/bold red] {e}")
             import traceback
             traceback.print_exc()
 
-        print()
+        console.print()
 
 
 def main(passed_args: argparse.Namespace = None):
@@ -258,12 +292,13 @@ def main(passed_args: argparse.Namespace = None):
 
     validate_args(args)
 
+    console.print("[dim]Loading models...[/dim]")
     models = load_models(args)
 
     try:
         run_tui(models, args)
     except KeyboardInterrupt:
-        print("\n\nInterrupted. Goodbye!")
+        console.print("\n\n[dim]Interrupted. Goodbye![/dim]")
 
 
 if __name__ == "__main__":

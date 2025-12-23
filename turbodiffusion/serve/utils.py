@@ -58,9 +58,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def format_config(args: argparse.Namespace, defaults: dict) -> str:
-    """Format configuration as a string for display."""
+    """Format configuration as a string for display (with rich markup)."""
     lines = []
-    lines.append("\n=== Launch Configuration (immutable) ===")
+    lines.append("\n[bold cyan]Launch Configuration (immutable)[/bold cyan]")
     lines.append(f"  mode:            {args.mode}")
     lines.append(f"  model:           {args.model}")
 
@@ -81,11 +81,11 @@ def format_config(args: argparse.Namespace, defaults: dict) -> str:
     lines.append(f"  default_norm:    {args.default_norm}")
     lines.append(f"  seed:            {args.seed}")
 
-    lines.append("\n=== Runtime Configuration (adjustable) ===")
+    lines.append("\n[bold cyan]Runtime Configuration (adjustable)[/bold cyan]")
     for param in RUNTIME_PARAMS:
         val = getattr(args, param)
         default = defaults[param]
-        marker = " *" if val != default else ""
+        marker = " [yellow]*[/yellow]" if val != default else ""
         lines.append(f"  {param}: {val}{marker}")
 
     return "\n".join(lines)
