@@ -88,10 +88,11 @@ WAN2PT1_1PT3B_RES480P_T2V: LazyDict = LazyDict(
         ),
         model=dict(
             config=dict(
+                sla_topk=0.1,
                 fsdp_shard_size=4,
                 resolution="480p",
                 timestep_shift=5,
-                state_t=20,
+                state_t=21,
                 grad_clip=False,
                 tokenizer=dict(vae_pth="assets/checkpoints/Wan2.1_VAE.pth"),
                 text_encoder_path="assets/checkpoints/models_t5_umt5-xxl-enc-bf16.pth",
@@ -156,7 +157,7 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
         ),
         model=dict(
             config=dict(
-                state_t=20,
+                state_t=21,
                 fsdp_shard_size=32,
                 teacher_ckpt="assets/checkpoints/Wan2.1-T2V-14B.dcp/model",
                 net=dict(
@@ -180,9 +181,13 @@ WAN2PT1_14B_RES480P_T2V: LazyDict = LazyDict(
                     every_n=250,
                 ),
             ),
+            grad_accum_iter=32,
         ),
         model_parallel=dict(
-            context_parallel_size=10,
+            context_parallel_size=8,
+        ),
+        dataloader_train=dict(
+            batch_size=1,
         ),
     ),
     flags={"allow_objects": True},

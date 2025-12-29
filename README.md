@@ -543,7 +543,7 @@ We implement white-box SLA training by aligning the predictions of the SLA-enabl
 Single-node training example:
 
 ```bash
-WORKDIR="/your/path/to/turbodiffusion"
+WORKDIR="/path/to/TurboDiffusion"
 cd $WORKDIR
 export PYTHONPATH=turbodiffusion
 
@@ -560,7 +560,7 @@ registry=registry_sla
 experiment=wan2pt1_1pt3B_res480p_t2v_SLA
 
 torchrun --nproc_per_node=8 \
-    -m scripts.train --config=rcm/configs/${registry}.py -- experiment=${experiment} \
+    -m scripts.train --config=turbodiffusion/rcm/configs/${registry}.py -- experiment=${experiment} \
         model.config.teacher_ckpt=${CHECKPOINT_ROOT}/Wan2.1-T2V-1.3B.dcp \
         model.config.tokenizer.vae_pth=${CHECKPOINT_ROOT}/Wan2.1_VAE.pth \
         model.config.text_encoder_path=${CHECKPOINT_ROOT}/models_t5_umt5-xxl-enc-bf16.pth \
@@ -583,7 +583,7 @@ We thank the community effort [Comfyui_turbodiffusion](https://github.com/anvesh
 We're actively working on the following features and improvements:
 
 - [x] Organize and release training code
-- [ ] Optimize infrastructure for better parallel
+- [x] Optimize infrastructure to support flattened context parallel
 - [ ] vLLM-Omni integration
 - [ ] Support for more video generation models
 - [ ] Support for autoregressive video generation models

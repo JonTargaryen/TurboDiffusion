@@ -48,13 +48,12 @@ from rcm.conditioner import DataType, TextCondition, concat_condition
 from rcm.utils.optim_instantiate_dtensor import get_base_scheduler
 from rcm.utils.lognormal import LogNormal
 from rcm.utils.checkpointer import non_strict_load_model
-from rcm.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp
 from rcm.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
 from rcm.utils.fsdp_helper import hsdp_device_mesh
 from rcm.utils.jvp_helper import TensorWithT
 from rcm.utils.misc import count_params
 from rcm.utils.torch_future import clip_grad_norm_
-from rcm.modules.denoiser_scaling import RectifiedFlow_TrigFlowWrapper
+from rcm.utils.denoiser_scaling import RectifiedFlow_TrigFlowWrapper
 from rcm.configs.defaults.ema import EMAConfig
 from rcm.samplers.euler import FlowEulerSampler
 from rcm.samplers.unipc import FlowUniPCMultistepSampler
@@ -268,6 +267,19 @@ class T2VDistillModel_rCM(ImaginaireModel):
                     self.net_fake_score.load_state_dict(self.net_teacher.state_dict())
             self.net_teacher.requires_grad_(False)
             self._param_count = count_params(self.net, verbose=False)
+
+            # Enable/disable CP once; all CP comm/split/gather happens inside net.forward now.
+            cp_group = self.get_context_parallel_group()
+            if cp_group is not None and cp_group.size() > 1:
+                self.net.enable_context_parallel(cp_group)
+                self.net_teacher.enable_context_parallel(cp_group)
+                if self.net_fake_score:
+                    self.net_fake_score.enable_context_parallel(cp_group)
+            else:
+                self.net.disable_context_parallel()
+                self.net_teacher.disable_context_parallel()
+                if self.net_fake_score:
+                    self.net_fake_score.disable_context_parallel()
 
             if config.ema.enabled:
                 self.net_ema = self.build_net(config.net)
@@ -534,15 +546,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
         time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
 
-        # Broadcast and split the input data and condition for model parallelism
-        (
-            x0_B_C_T_H_W,
-            condition,
-            uncondition,
-            epsilon_B_C_T_H_W,
-            time_B_T,
-        ) = self.broadcast_split_for_model_parallelsim(x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, time_B_T)
-
         time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
         cost_B_1_T_1_1, sint_B_1_T_1_1 = torch.cos(time_B_1_T_1_1), torch.sin(time_B_1_T_1_1)
         # Generate noisy observations
@@ -584,7 +587,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 with torch.no_grad():
                     G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
                 G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
-                G_time_B_T = self.sync(G_time_B_T, condition)
                 G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
                 G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
                 G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
@@ -642,7 +644,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         if self.net_fake_score and iteration > self.tangent_warmup:
             D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
-            D_time_B_T = self.sync(D_time_B_T, condition)
             D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
             D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * torch.cos(D_time_B_1_T_1_1) + torch.randn_like(x0_B_C_T_H_W) * torch.sin(D_time_B_1_T_1_1)
 
@@ -677,14 +678,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
         time_B_T = self.draw_training_time_G(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
 
-        # Broadcast and split the input data and condition for model parallelism
-        (
-            x0_B_C_T_H_W,
-            condition,
-            uncondition,
-            epsilon_B_C_T_H_W,
-            time_B_T,
-        ) = self.broadcast_split_for_model_parallelsim(x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, time_B_T)
         G_time_B_T = math.pi / 2 * torch.ones_like(time_B_T)
         G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
         G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
@@ -695,7 +688,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             with torch.no_grad():
                 G_x0_B_C_T_H_W = self.denoise(G_xt_B_C_T_H_W, G_time_B_T, condition, net_type="student").x0
             G_time_B_T = torch.minimum(self.draw_training_time_D(x0_B_C_T_H_W.size(), condition), G_time_B_T)
-            G_time_B_T = self.sync(G_time_B_T, condition)
             G_time_B_1_T_1_1 = rearrange(G_time_B_T, "b t -> b 1 t 1 1")
             G_cost_B_1_T_1_1, G_sint_B_1_T_1_1 = torch.cos(G_time_B_1_T_1_1), torch.sin(G_time_B_1_T_1_1)
             G_xt_B_C_T_H_W = G_x0_B_C_T_H_W * G_cost_B_1_T_1_1 + torch.randn_like(epsilon_B_C_T_H_W) * G_sint_B_1_T_1_1
@@ -705,7 +697,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
 
         D_time_B_T = self.draw_training_time_D(x0_B_C_T_H_W.size(), condition)
         D_epsilon_B_C_T_H_W = torch.randn_like(x0_B_C_T_H_W)
-        D_time_B_T = self.sync(D_time_B_T, condition)
         D_time_B_1_T_1_1 = rearrange(D_time_B_T, "b t -> b 1 t 1 1")
         D_cost_B_1_T_1_1, D_sint_B_1_T_1_1 = torch.cos(D_time_B_1_T_1_1), torch.sin(D_time_B_1_T_1_1)
         D_xt_theta_B_C_T_H_W = G_x0_theta_B_C_T_H_W * D_cost_B_1_T_1_1 + D_epsilon_B_C_T_H_W * D_sint_B_1_T_1_1
@@ -765,7 +756,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
     def get_x0_fn_from_batch(self, data_batch: Dict) -> Callable:
 
         _, _, condition, uncondition = self.get_data_and_condition(data_batch)
-        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
 
         # For inference, check if parallel_state is initialized
         if not parallel_state.is_initialized():
@@ -816,9 +806,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 generator=generator,
             )
 
-        if self.net.is_context_parallel_enabled:
-            init_noise = broadcast_split_tensor(init_noise, seq_dim=2, process_group=self.get_context_parallel_group())
-
         if mid_t is None:
             mid_t = [1.3, 1.0, 0.6][: num_steps - 1]
 
@@ -843,12 +830,8 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 device=self.tensor_kwargs["device"],
                 generator=generator,
             )
-            if self.net.is_context_parallel_enabled:
-                noise = broadcast_split_tensor(noise, seq_dim=2, process_group=self.get_context_parallel_group())
             x = torch.cos(t_next) * x + torch.sin(t_next) * noise
         samples = x.float()
-        if self.net.is_context_parallel_enabled:
-            samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
         return torch.nan_to_num(samples)
 
     @torch.no_grad()
@@ -875,7 +858,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             num_steps (int): number of steps for the diffusion process
         """
         _, _, condition, uncondition = self.get_data_and_condition(data_batch)
-        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
 
         input_key = self.input_data_key
 
@@ -901,9 +883,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
                 device=self.tensor_kwargs["device"],
                 generator=generator,
             )
-
-        if self.net_teacher.is_context_parallel_enabled:
-            init_noise = broadcast_split_tensor(init_noise, seq_dim=2, process_group=self.get_context_parallel_group())
 
         x = init_noise.to(torch.float64)
 
@@ -931,8 +910,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
             x = sampler.step(v_pred, t, x)
 
         samples = x.float()
-        if self.net_teacher.is_context_parallel_enabled:
-            samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
 
         return torch.nan_to_num(samples)
 
@@ -950,45 +927,6 @@ class T2VDistillModel_rCM(ImaginaireModel):
         if parallel_state.is_initialized():
             return parallel_state.get_context_parallel_group()
         return None
-
-    def sync(self, tensor, condition):
-        cp_group = self.get_context_parallel_group()
-        cp_size = 1 if cp_group is None else cp_group.size()
-        if condition.is_video and cp_size > 1:
-            tensor = broadcast(tensor, cp_group)
-        return tensor
-
-    def broadcast_split_for_model_parallelsim(self, x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, sigma_B_T):
-        """
-        Broadcast and split the input data and condition for model parallelism.
-        Currently, we only support context parallelism.
-        """
-        cp_group = self.get_context_parallel_group()
-        cp_size = 1 if cp_group is None else cp_group.size()
-        if condition.is_video and cp_size > 1:
-            x0_B_C_T_H_W = broadcast_split_tensor(x0_B_C_T_H_W, seq_dim=2, process_group=cp_group)
-            epsilon_B_C_T_H_W = broadcast_split_tensor(epsilon_B_C_T_H_W, seq_dim=2, process_group=cp_group)
-            if sigma_B_T is not None:
-                assert sigma_B_T.ndim == 2, "sigma_B_T should be 2D tensor"
-                if sigma_B_T.shape[-1] == 1:
-                    sigma_B_T = broadcast(sigma_B_T, cp_group)
-                else:
-                    sigma_B_T = broadcast_split_tensor(sigma_B_T, seq_dim=1, process_group=cp_group)
-            condition = condition.broadcast(cp_group)
-            uncondition = uncondition.broadcast(cp_group)
-            self.net.enable_context_parallel(cp_group)
-            if self.net_teacher:
-                self.net_teacher.enable_context_parallel(cp_group)
-            if self.net_fake_score:
-                self.net_fake_score.enable_context_parallel(cp_group)
-        else:
-            self.net.disable_context_parallel()
-            if self.net_teacher:
-                self.net_teacher.disable_context_parallel()
-            if self.net_fake_score:
-                self.net_fake_score.disable_context_parallel()
-
-        return x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, sigma_B_T
 
     # ------------------ Data Preprocessing ------------------
 

@@ -47,7 +47,6 @@ from rcm.conditioner import DataType, TextCondition
 from rcm.utils.optim_instantiate_dtensor import get_base_scheduler
 from rcm.utils.lognormal import LogNormal
 from rcm.utils.checkpointer import non_strict_load_model
-from rcm.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp
 from rcm.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
 from rcm.utils.fsdp_helper import hsdp_device_mesh
 from rcm.utils.misc import count_params
@@ -114,7 +113,7 @@ class T2VConfig_SLA:
     text_encoder_class: str = "umT5"
     text_encoder_path: str = ""
 
-    sla_topk: float = 0.2
+    sla_topk: float = 0.1
 
 
 class T2VModel_SLA(ImaginaireModel):
@@ -249,6 +248,15 @@ class T2VModel_SLA(ImaginaireModel):
             self.net_teacher.requires_grad_(False)
             self._param_count = count_params(self.net, verbose=False)
 
+            # Enable/disable CP once; all CP comm/split/gather happens inside net.forward now.
+            cp_group = self.get_context_parallel_group()
+            if cp_group is not None and cp_group.size() > 1:
+                self.net.enable_context_parallel(cp_group)
+                self.net_teacher.enable_context_parallel(cp_group)
+            else:
+                self.net.disable_context_parallel()
+                self.net_teacher.disable_context_parallel()
+
             if config.ema.enabled:
                 self.net_ema = self.build_net(config.net, replace_sla=True)
                 self.net_ema.requires_grad_(False)
@@ -311,15 +319,6 @@ class T2VModel_SLA(ImaginaireModel):
 
         time_B_T = self.draw_training_time(x0_B_C_T_H_W.size(), condition)
         epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
-
-        # Broadcast and split the input data and condition for model parallelism
-        (
-            x0_B_C_T_H_W,
-            condition,
-            uncondition,
-            epsilon_B_C_T_H_W,
-            time_B_T,
-        ) = self.broadcast_split_for_model_parallelsim(x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, time_B_T)
 
         time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
         xt_B_C_T_H_W = (1 - time_B_1_T_1_1) * x0_B_C_T_H_W + time_B_1_T_1_1 * epsilon_B_C_T_H_W
@@ -394,7 +393,6 @@ class T2VModel_SLA(ImaginaireModel):
             num_steps (int): number of steps for the diffusion process
         """
         _, _, condition, uncondition = self.get_data_and_condition(data_batch)
-        _, condition, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(None, condition, uncondition, None, None)
 
         input_key = self.input_data_key
 
@@ -423,9 +421,6 @@ class T2VModel_SLA(ImaginaireModel):
                 generator=generator,
             )
 
-        if net.is_context_parallel_enabled:
-            init_noise = broadcast_split_tensor(init_noise, seq_dim=2, process_group=self.get_context_parallel_group())
-
         x = init_noise.to(torch.float64)
 
         sigma_max = self.config.sigma_max / (self.config.sigma_max + 1)
@@ -450,9 +445,6 @@ class T2VModel_SLA(ImaginaireModel):
             x = sampler.step(v_pred, t, x)
 
         samples = x.float()
-        if net.is_context_parallel_enabled:
-            samples = cat_outputs_cp(samples, seq_dim=2, cp_group=self.get_context_parallel_group())
-
         return torch.nan_to_num(samples)
 
     @torch.no_grad()
@@ -469,39 +461,6 @@ class T2VModel_SLA(ImaginaireModel):
         if parallel_state.is_initialized():
             return parallel_state.get_context_parallel_group()
         return None
-
-    def sync(self, tensor, condition):
-        cp_group = self.get_context_parallel_group()
-        cp_size = 1 if cp_group is None else cp_group.size()
-        if condition.is_video and cp_size > 1:
-            tensor = broadcast(tensor, cp_group)
-        return tensor
-
-    def broadcast_split_for_model_parallelsim(self, x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, sigma_B_T):
-        """
-        Broadcast and split the input data and condition for model parallelism.
-        Currently, we only support context parallelism.
-        """
-        cp_group = self.get_context_parallel_group()
-        cp_size = 1 if cp_group is None else cp_group.size()
-        if condition.is_video and cp_size > 1:
-            x0_B_C_T_H_W = broadcast_split_tensor(x0_B_C_T_H_W, seq_dim=2, process_group=cp_group)
-            epsilon_B_C_T_H_W = broadcast_split_tensor(epsilon_B_C_T_H_W, seq_dim=2, process_group=cp_group)
-            if sigma_B_T is not None:
-                assert sigma_B_T.ndim == 2, "sigma_B_T should be 2D tensor"
-                if sigma_B_T.shape[-1] == 1:
-                    sigma_B_T = broadcast(sigma_B_T, cp_group)
-                else:
-                    sigma_B_T = broadcast_split_tensor(sigma_B_T, seq_dim=1, process_group=cp_group)
-            condition = condition.broadcast(cp_group)
-            uncondition = uncondition.broadcast(cp_group)
-            self.net.enable_context_parallel(cp_group)
-            self.net_teacher.enable_context_parallel(cp_group)
-        else:
-            self.net.disable_context_parallel()
-            self.net_teacher.disable_context_parallel()
-
-        return x0_B_C_T_H_W, condition, uncondition, epsilon_B_C_T_H_W, sigma_B_T
 
     # ------------------ Data Preprocessing ------------------
 
